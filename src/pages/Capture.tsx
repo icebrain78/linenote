@@ -9,7 +9,7 @@ import { structureDefectNote } from '../ai/models';
 import { localDb, maskWithGlobalTokenMap } from '../data/db';
 import { syncMaskedRecord } from '../data/sync';
 import { resizeImageToJpeg } from '../utils/image';
-import type { DefectRecord, InferenceSourceType, StructuredDefect } from '../types';
+import type { DefectRecord, InferenceSourceType, SensitiveSpan, StructuredDefect } from '../types';
 import { EditableStructuredCard } from '../components/RecordCard';
 
 const LINES = [
@@ -29,6 +29,13 @@ export function Capture() {
   const [streamingPreview, setStreamingPreview] = useState('');
   const [streamingTtftMs, setStreamingTtftMs] = useState<number | undefined>();
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [blockedPayload, setBlockedPayload] = useState<{
+    rawNote: string;
+    line: string;
+    imageDataUrl?: string;
+    detectedSpans: SensitiveSpan[];
+    reason: string;
+  } | null>(null);
   const [savedBanner, setSavedBanner] = useState<string | null>(null);
 
   const [draftResult, setDraftResult] = useState<{
@@ -102,6 +109,8 @@ export function Capture() {
       return;
     }
     setProcessing(true);
+    setDraftResult(null);
+    setBlockedPayload(null);
     setStreamingPreview('');
     setStreamingTtftMs(undefined);
     setErrorMsg(null);
@@ -136,46 +145,69 @@ export function Capture() {
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setErrorMsg(message);
-
-      // If ONLY_ON_DEVICE failed because no local model is available, save raw note locally without AI
-      if (route.mode === InferenceMode.ONLY_ON_DEVICE) {
-        const fallbackStructured: StructuredDefect = {
-          defectType: 'OTHER',
-          part: 'Unstructured',
-          location: 'Unspecified',
-          quantity: 1,
-          severity: 'MAJOR',
-          suspectedCause: 'Pending manual classification',
-          immediateAction: 'Saved locally without AI',
-          sensitiveSpans: route.detectedSpans,
-          confidence: 0,
-        };
-        const masked = await maskWithGlobalTokenMap(rawNote, fallbackStructured, route.detectedSpans, true);
-        const id = `rec_${Date.now()}`;
-        const now = new Date().toISOString();
-        await localDb.records.add({
-          id,
-          uid: auth?.currentUser?.uid || 'local',
-          line,
+      setDraftResult(null);
+      if (route.mode === InferenceMode.ONLY_ON_DEVICE || /block/i.test(message)) {
+        setErrorMsg(null);
+        setBlockedPayload({
           rawNote,
-          maskedNote: masked.maskedNote,
+          line,
           imageDataUrl,
-          structured: fallbackStructured,
-          maskedStructured: masked.maskedStructured,
-          confidential: true,
-          maskingMap: masked.maskingMap,
-          inferenceSource: 'none',
-          latencyMs: 0,
-          syncStatus: 'local_only',
-          blockedReason: message,
-          createdAt: now,
-          updatedAt: now,
+          detectedSpans: route.detectedSpans,
+          reason: message,
         });
+      } else {
+        setBlockedPayload(null);
+        setErrorMsg(message);
       }
     } finally {
       setProcessing(false);
     }
+  };
+
+  const handleSaveBlockedLocally = async () => {
+    if (!blockedPayload) return;
+    const fallbackStructured: StructuredDefect = {
+      defectType: 'OTHER',
+      part: 'Unstructured',
+      location: 'Unspecified',
+      quantity: 1,
+      severity: 'MAJOR',
+      suspectedCause: 'Pending manual classification',
+      immediateAction: 'Saved locally without AI',
+      sensitiveSpans: blockedPayload.detectedSpans,
+      confidence: 0,
+    };
+    const masked = await maskWithGlobalTokenMap(
+      blockedPayload.rawNote,
+      fallbackStructured,
+      blockedPayload.detectedSpans,
+      true
+    );
+    const id = `rec_${Date.now()}`;
+    const now = new Date().toISOString();
+    await localDb.records.add({
+      id,
+      uid: auth?.currentUser?.uid || 'local',
+      line: blockedPayload.line,
+      rawNote: blockedPayload.rawNote,
+      maskedNote: masked.maskedNote,
+      imageDataUrl: blockedPayload.imageDataUrl,
+      structured: fallbackStructured,
+      maskedStructured: masked.maskedStructured,
+      confidential: true,
+      maskingMap: masked.maskingMap,
+      inferenceSource: 'none',
+      latencyMs: 0,
+      syncStatus: 'local_only',
+      blockedReason: blockedPayload.reason,
+      createdAt: now,
+      updatedAt: now,
+    });
+    setBlockedPayload(null);
+    setSavedBanner('Saved locally without AI (never sent to cloud).');
+    setRawNote('');
+    setImageDataUrl(undefined);
+    setConfidential(false);
   };
 
   const handleSaveConfirmed = async () => {
@@ -416,7 +448,24 @@ export function Capture() {
           </div>
         )}
 
-        {errorMsg && (
+        {blockedPayload && (
+          <div className="space-y-3 rounded-xl border border-rose-300 bg-rose-50 p-4 text-sm font-medium text-rose-900">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="h-5 w-5 shrink-0 text-rose-600 mt-0.5" />
+              <div>{blockedPayload.reason}</div>
+            </div>
+            <button
+              type="button"
+              onClick={handleSaveBlockedLocally}
+              className="flex items-center justify-center gap-2 rounded-lg border border-rose-400 bg-white px-4 py-2 text-xs font-bold text-rose-900 hover:bg-rose-100"
+            >
+              <Save className="h-4 w-4" />
+              <span>Save locally without AI</span>
+            </button>
+          </div>
+        )}
+
+        {errorMsg && !blockedPayload && (
           <div className="flex items-start gap-2.5 rounded-xl border border-rose-300 bg-rose-50 p-4 text-sm font-medium text-rose-900">
             <AlertTriangle className="h-5 w-5 shrink-0 text-rose-600 mt-0.5" />
             <div>{errorMsg}</div>
