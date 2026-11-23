@@ -41,7 +41,7 @@ function setOnDeviceStatus(status: OnDeviceStatus, progress = 0) {
 
 export async function checkChromeLanguageModelAvailability(): Promise<string> {
   try {
-    const win = window as unknown as {
+    const win = globalThis as unknown as {
       LanguageModel?: { availability?: () => Promise<string> };
       ai?: { languageModel?: { capabilities?: () => Promise<{ available: string }> } };
     };
@@ -66,6 +66,23 @@ export async function checkChromeLanguageModelAvailability(): Promise<string> {
   } catch (err) {
     setOnDeviceStatus('unavailable', 0);
     return `error: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+async function isOnDeviceLanguageModelAvailable(): Promise<boolean> {
+  const lm = (
+    globalThis as unknown as {
+      LanguageModel?: { availability?: () => Promise<string> };
+    }
+  ).LanguageModel;
+  if (typeof lm === 'undefined' || typeof lm?.availability !== 'function') {
+    return false;
+  }
+  try {
+    const status = await lm.availability();
+    return status === 'available';
+  } catch {
+    return false;
   }
 }
 
@@ -328,10 +345,31 @@ export async function structureDefectNote(params: {
 }): Promise<StructureResult> {
   const { noteText, line, imageDataUrl, mode, onToken } = params;
   const hasImage = Boolean(imageDataUrl);
+  const t0 = performance.now();
+
+  // Explicit fail-closed pre-guard: never touch firebase/ai when ONLY_ON_DEVICE lacks LanguageModel
+  if (mode === InferenceMode.ONLY_ON_DEVICE) {
+    const ready = await isOnDeviceLanguageModelAvailable();
+    if (!ready) {
+      const ms = Math.round(performance.now() - t0);
+      await addHybridLog({
+        task: 'structure_note',
+        requestedMode: mode,
+        actualSource: 'none',
+        ttftMs: ms,
+        latencyMs: ms,
+        cloudBytes: 0,
+        blocked: true,
+        reason: 'no on-device model',
+      });
+      throw new Error(
+        'This note contains confidential data and no on-device model is available. BLOCKED: no on-device model'
+      );
+    }
+  }
+
   const model = getStructurerModel(mode, hasImage);
   const initKey = `structurer:${mode}:${hasImage ? 'img' : 'txt'}`;
-
-  const t0 = performance.now();
 
   try {
     await ensureInitializedOnce(initKey, model);
@@ -346,10 +384,10 @@ export async function structureDefectNote(params: {
         latencyMs: ms,
         cloudBytes: 0,
         blocked: true,
-        reason: 'On-device model unavailable for ONLY_ON_DEVICE request',
+        reason: 'no on-device model',
       });
       throw new Error(
-        'This note contains confidential data and no on-device model is available. Saved locally without AI.'
+        'This note contains confidential data and no on-device model is available. BLOCKED: no on-device model'
       );
     }
     console.warn('On-device model init skipped/failed, falling back if allowed:', initErr);
@@ -374,11 +412,50 @@ export async function structureDefectNote(params: {
   try {
     streamOut = await runStreamed(model, parts, t0, onToken);
   } catch (err) {
-    if (err instanceof ChromiumEchoStubError) {
-      if (mode === InferenceMode.PREFER_ON_DEVICE) {
+    if (mode === InferenceMode.PREFER_ON_DEVICE) {
+      // Retry once with ONLY_IN_CLOUD for non-confidential notes when on-device generation fails
+      try {
         const cloudModel = getStructurerModel(InferenceMode.ONLY_IN_CLOUD, hasImage);
         streamOut = await runStreamed(cloudModel, parts, t0, onToken);
-      } else {
+      } catch (cloudErr) {
+        if (hasImage) {
+          try {
+            const cloudTextModel = getStructurerModel(InferenceMode.ONLY_IN_CLOUD, false);
+            streamOut = await runStreamed(cloudTextModel, promptText, t0, onToken);
+          } catch (textCloudErr) {
+            const ms = Math.round(performance.now() - t0);
+            await addHybridLog({
+              task: 'structure_note',
+              requestedMode: mode,
+              actualSource: 'none',
+              ttftMs: ms,
+              latencyMs: ms,
+              cloudBytes: 0,
+              blocked: false,
+              reason: textCloudErr instanceof Error ? textCloudErr.message : String(textCloudErr),
+            });
+            throw textCloudErr;
+          }
+        } else {
+          const ms = Math.round(performance.now() - t0);
+          await addHybridLog({
+            task: 'structure_note',
+            requestedMode: mode,
+            actualSource: 'none',
+            ttftMs: ms,
+            latencyMs: ms,
+            cloudBytes: 0,
+            blocked: false,
+            reason: cloudErr instanceof Error ? cloudErr.message : String(cloudErr),
+          });
+          throw cloudErr;
+        }
+      }
+    } else if (hasImage && !(err instanceof ChromiumEchoStubError)) {
+      try {
+        const textModel = getStructurerModel(mode, false);
+        streamOut = await runStreamed(textModel, promptText, t0, onToken);
+      } catch (textErr) {
         const ms = Math.round(performance.now() - t0);
         await addHybridLog({
           task: 'structure_note',
@@ -387,18 +464,19 @@ export async function structureDefectNote(params: {
           ttftMs: ms,
           latencyMs: ms,
           cloudBytes: 0,
-          blocked: true,
-          reason: err.message,
+          blocked: mode === InferenceMode.ONLY_ON_DEVICE,
+          reason: textErr instanceof Error ? textErr.message : String(textErr),
         });
-        throw new Error(
-          'This note contains confidential data and no on-device model is available. Saved locally without AI.'
-        );
+        throw textErr;
       }
-    } else if (hasImage) {
-      const textModel = getStructurerModel(mode, false);
-      streamOut = await runStreamed(textModel, promptText, t0, onToken);
     } else {
       const ms = Math.round(performance.now() - t0);
+      const reason =
+        err instanceof ChromiumEchoStubError
+          ? 'no on-device model'
+          : err instanceof Error
+            ? err.message
+            : String(err);
       await addHybridLog({
         task: 'structure_note',
         requestedMode: mode,
@@ -407,10 +485,36 @@ export async function structureDefectNote(params: {
         latencyMs: ms,
         cloudBytes: 0,
         blocked: mode === InferenceMode.ONLY_ON_DEVICE,
-        reason: err instanceof Error ? err.message : String(err),
+        reason,
       });
+      if (err instanceof ChromiumEchoStubError && mode === InferenceMode.ONLY_ON_DEVICE) {
+        throw new Error(
+          'This note contains confidential data and no on-device model is available. BLOCKED: no on-device model'
+        );
+      }
       throw err;
     }
+  }
+
+  // Defense-in-depth post-guard: confidential notes must never accept cloud inference
+  if (
+    mode === InferenceMode.ONLY_ON_DEVICE &&
+    String(streamOut.source).toLowerCase() !== 'on_device'
+  ) {
+    const ms = Math.round(performance.now() - t0);
+    await addHybridLog({
+      task: 'structure_note',
+      requestedMode: mode,
+      actualSource: 'none',
+      ttftMs: streamOut.ttftMs ?? ms,
+      latencyMs: ms,
+      cloudBytes: 0,
+      blocked: true,
+      reason: 'unexpected cloud inference',
+    });
+    throw new Error(
+      'BLOCKED: unexpected cloud inference for confidential note. Result discarded.'
+    );
   }
 
   const cloudBytes = streamOut.source === 'in_cloud' ? new Blob([promptText]).size : 0;
